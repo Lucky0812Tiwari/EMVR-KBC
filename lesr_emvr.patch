@@ -1,0 +1,127 @@
+--- lesr_original.py	2026-07-10 05:58:36.268436202 +0000
++++ lesr.py	2026-07-10 05:58:07.920911266 +0000
+@@ -2,6 +2,7 @@
+ import logging
+ import sys
+ import os
++import json
+ import yaml
+ import numpy as np
+ import random
+@@ -22,6 +23,12 @@
+ 
+ from reasoner import prepare_rules, get_model_and_tokenizer, get_phrase_embedding, custom_similarity, find_similar_phrases, convert_arr_to_sparse_coo,  load_grounding_results, save_grounding_results, ground_rules_over_kg_semantic, keep_good_rules, print_grounding_stats, get_unique_eval_query_ids, ReasonerModel, ReasonerModelPlus, train_loop, get_triplets_and_scores, compute_metrics,test_loop,test_loop_plus
+ 
++# ---------------- EMVR-KBC (NEW) ----------------
++from evidence import (build_adjacency, verify_rules_for_relation, apply_warmstart,
++                       ExternalEvidenceIndex, filtering_recall, ev_weight_correlation,
++                       grounding_flops_saved)
++# --------------------------------------------------
++
+ USE_LONG_REL_TEXT = False
+ 
+ os.environ["TOKENIZERS_PARALLELISM"] = "false"
+@@ -62,6 +69,25 @@
+     parser.add_argument("--scheduler_gamma", type=int, help="scheduler gamma for rule learning", default=0.1)
+     parser.add_argument("--early_stop_patience", type=int, help="number of epochs to wait before early stopping", default=30)
+     parser.add_argument('--exclude_unlearnable_relation', action='store_true', help='whether queries with unlearnable relations are included when computing metrics')
++    # ---------------- EMVR-KBC (NEW) ----------------
++    parser.add_argument('--use_emvr', action='store_true',
++        help='enable EMVR-KBC evidence verification before grounding')
++    parser.add_argument('--emvr_sample_size', type=int, default=500,
++        help='S in Eq.(1): max sampled entity pairs per rule for KBSample')
++    parser.add_argument('--emvr_beta', type=float, default=0.7,
++        help='beta in Eq.(5): weight on internal KB evidence vs external sim')
++    parser.add_argument('--emvr_tau_min', type=float, default=0.1)
++    parser.add_argument('--emvr_tau_max', type=float, default=0.5)
++    parser.add_argument('--emvr_external_density_gate', type=float, default=0.001,
++        help='only compute ExternalSim when density_r is below this')
++    parser.add_argument('--emvr_conceptnet_patterns', type=str, default=None,
++        help='optional path to a .json list of ConceptNet relation-chain '
++             'pattern strings for ExternalSim; omit to disable external evidence')
++    parser.add_argument('--use_emvr_warmstart', action='store_true',
++        help='warm-start ReasonerModel.raw_weights from EV_i instead of zeros')
++    parser.add_argument('--emvr_save_stats', action='store_true',
++        help='save per-relation EMVR-KBC evidence rows + EV scores to reasoner_dir for later analysis')
++    # --------------------------------------------------
+     return parser.parse_args()
+ 
+ def setup_logging(verbose, logfile=None, printlog=False):
+@@ -277,8 +303,49 @@
+             checked_rules = load_nested_list(all_rules_fname)
+             logging.info("load {} checked rules from disk for relation {}={}".format(len(checked_rules), relation_wk_idx, relation_text))
+             train_sparse = convert_arr_to_sparse_coo(train_arr, n_entities, n_relations)
++
++            # ---------------- EMVR-KBC: evidence verification (NEW) ----------------
++            emvr_ev_by_text = {}
++            if args.use_emvr and len(checked_rules) > 0:
++                fwd_adj, bwd_adj = build_adjacency(train_arr)
++                external_index = None
++                if args.emvr_conceptnet_patterns:
++                    with open(args.emvr_conceptnet_patterns) as f:
++                        patterns = json.load(f)
++                    external_index = ExternalEvidenceIndex(pattern_strings=patterns)
++                checked_rules, ev_scores_for_warmstart, emvr_stats = verify_rules_for_relation(
++                    checked_rules, relation2id_dict, train_arr, n_entities,
++                    target_relation_id=relation_wk_idx, fwd=fwd_adj, bwd=bwd_adj,
++                    sample_size=args.emvr_sample_size, beta=args.emvr_beta,
++                    tau_min=args.emvr_tau_min, tau_max=args.emvr_tau_max,
++                    external_density_gate=args.emvr_external_density_gate,
++                    external_index=external_index, verbose=args.debug)
++                emvr_ev_by_text = {row["rule_text"]: row["ev_i"] for row in emvr_stats["rows"] if row["verified"]}
++                print("[EMVR-KBC] relation {}={}: {}/{} rules verified, "
++                      "filtering_rate={:.1%}, tau_r={:.3f}".format(
++                          relation_wk_idx, relation_text, emvr_stats["n_verified"],
++                          emvr_stats["n_candidates"], emvr_stats["filtering_rate"],
++                          emvr_stats["tau_r"]))
++                if args.emvr_save_stats:
++                    emvr_stats_fname = os.path.join(reasoner_dir, "{}_emvr_stats.json".format(relation_wk_idx))
++                    with open(emvr_stats_fname, 'w') as f:
++                        json.dump(emvr_stats, f)
++                if len(checked_rules) == 0:
++                    print("no rules survived EMVR-KBC verification for relation={}, skip".format(relation))
++                    relation_wo_logicrules.append(relation)
++                    continue
++            # -------------------------------------------------------------------------
++
+             train_aligned_masks, train_chained_masks, train_ground_results,train_ground_rconds = ground_rules_over_kg_semantic(train_sparse, checked_rules, relation2id_dict, similarity_matrix,verbose=False)
+             checked_rules, train_aligned_masks, train_chained_masks, train_ground_results,train_ground_rconds = keep_good_rules(checked_rules, train_aligned_masks, train_chained_masks, train_ground_results,train_ground_rconds,verbose=args.debug, criteria=args.good_rule_criteria)
++            if args.use_emvr and len(emvr_ev_by_text) > 0:
++                # persisted regardless of emvr_save_stats: the reasoner-training loop
++                # below reloads checked_rules from disk in a separate pass and needs
++                # this file to align EV_i with the final post-keep_good_rules rule set
++                # for warm-start init (Eq. 10).
++                ev_scores_fname = os.path.join(reasoner_dir, "{}_ev_scores.json".format(relation_wk_idx))
++                with open(ev_scores_fname, 'w') as f:
++                    json.dump([emvr_ev_by_text.get(cr[0], 0.0) for cr in checked_rules], f)
+             save_grounding_results(grnd_save_prefix+"_train", train_aligned_masks, train_chained_masks, train_ground_results, train_ground_rconds)
+             logging.info("ground over train kg arr for relation {}={}".format(relation_wk_idx, relation_text))
+             test_sparse = convert_arr_to_sparse_coo(train_test_arr, n_entities, n_relations)
+@@ -394,6 +461,27 @@
+                         model = ReasonerModel(n_rules) 
+                     if not args.run_reasoner_models_on_cpu:
+                         model.to("cuda")
++
++                    # ---------------- EMVR-KBC: warm-start init (NEW) ----------------
++                    if args.use_emvr and args.use_emvr_warmstart:
++                        ev_scores_fname = os.path.join(reasoner_dir, "{}_ev_scores.json".format(relation_wk_idx))
++                        if file_exists(ev_scores_fname):
++                            with open(ev_scores_fname) as f:
++                                aligned_ev = json.load(f)
++                            # aligned_ev has one entry per logical rule (n_rules - 1);
++                            # pad/truncate defensively in case checked_rules count
++                            # drifted between the grounding pass and this pass.
++                            n_logical = n_rules - 1
++                            if len(aligned_ev) != n_logical:
++                                aligned_ev = (aligned_ev + [0.0] * n_logical)[:n_logical]
++                            model = apply_warmstart(model, aligned_ev)
++                            print("[EMVR-KBC] warm-started {} logical-rule weights from EV_i "
++                                  "(loss function L1 unchanged)".format(n_logical))
++                        else:
++                            print("[EMVR-KBC] no saved EV scores found for relation {}, "
++                                  "falling back to random init".format(relation_wk_idx))
++                    # -------------------------------------------------------------------
++
+                     optimizer = optim.AdamW(model.parameters(), lr=args.initial_lr, weight_decay=args.weight_decay)
+                     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.scheduler_step, gamma=args.scheduler_gamma)
+                     best_valid_loss = float('inf')

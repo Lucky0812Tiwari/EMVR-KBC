@@ -1,0 +1,39 @@
+# ============================================================
+# requirements.txt — LeSR + EMVR-KBC
+# ============================================================
+# Python 3.9.19 (as specified by the LeSR repo README)
+#
+# Section 1: original LeSR dependencies (from hyanique/LeSR README.md,
+#            "Dependencies" section — pinned versions unchanged).
+# Section 2: additional packages LeSR imports/uses but that were not
+#            listed in the README (confirmed by scanning all .py files'
+#            import statements) — left unpinned so pip resolves versions
+#            compatible with torch==2.3.0 / transformers==4.40.1 above.
+# Section 3: new, EMVR-KBC-only dependency (evidence.py). Optional at
+#            runtime — evidence.py degrades gracefully to internal-only
+#            evidence if this is missing — but included here so a single
+#            `pip install -r requirements.txt` gets everything.
+# ============================================================
+
+# ---- 1. Original LeSR dependencies ----
+transformers==4.40.1
+scikit-learn==1.4.2
+scipy==1.13.0
+torch==2.3.0
+nltk==3.8.1
+sentence-transformers==3.0.0
+sentencepiece==0.2.0
+openai==1.24.0
+google-generativeai==0.7.2
+groq==0.31.0
+
+# ---- 2. Additional LeSR dependencies (used in the code, not in README) ----
+numpy
+pandas
+PyYAML
+
+# ---- 3. EMVR-KBC addition (evidence.py) ----
+# Only needed if you pass --emvr_conceptnet_patterns to enable optional
+# external evidence (Eq. 4-5 of the proposal). Safe to leave installed
+# even when unused.
+faiss-cpu>=1.7.4

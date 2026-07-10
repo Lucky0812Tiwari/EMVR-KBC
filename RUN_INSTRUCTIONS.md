@@ -3,10 +3,11 @@
 This package contains the LeSR files with EMVR-KBC already applied, ready to
 drop into a clone of `hyanique/LeSR`.
 
-## Files in this package
+## 0. Files in this package
 
 | File | What it is |
 |---|---|
+| `requirements.txt` | **New.** All packages needed to run LeSR + EMVR-KBC, in one place — original LeSR deps (from its README) plus EMVR-KBC's optional `faiss-cpu`. |
 | `evidence.py` | **New file.** The entire EMVR-KBC contribution (evidence sampling, verification, warm-start, metrics). |
 | `lesr.py` | **Modified.** Your original `lesr.py` with the EMVR-KBC hooks applied (see `lesr_emvr.patch` for the exact diff). Everything else in the file is untouched. |
 | `lesr_emvr.patch` | Unified diff of `lesr.py` (original repo version → patched version), so you can `git apply` it directly instead of copying the file, or just review exactly what changed. |
@@ -22,10 +23,14 @@ copies of those.
 ```bash
 git clone https://github.com/hyanique/LeSR.git
 cd LeSR
-# install LeSR's own requirements first (however the repo documents that,
-# e.g. pip install -r requirements.txt)
-pip install faiss-cpu          # new, only needed if you use external evidence
+cp /path/to/downloaded/requirements.txt .
+pip install -r requirements.txt
 ```
+
+That single `pip install` covers everything: LeSR's original pinned deps
+(transformers, torch, sentence-transformers, etc. — copied straight from the
+repo's README) plus `faiss-cpu` for EMVR-KBC's optional external evidence.
+No separate install step needed later.
 
 ## 2. Drop in the EMVR-KBC files
 

@@ -38,6 +38,9 @@ def parse_args():
     parser.add_argument('-v', '--verbose', action='store_true', help='Increase output verbosity')
     parser.add_argument('-c', '--config_file', type=str, required=False, help='Path to the configuration file')
     parser.add_argument('--debug', action='store_true', help='whether to run script in debug mode')
+    parser.add_argument('--debug_relation_limit', type=int, default=None,
+        help='quick-debug: run only the first N relations (in dataset order) instead of all/debug_idx. '
+             'Independent of --debug; e.g. --debug_relation_limit 3 for a fast smoke test.')
     parser.add_argument("--rand_seed", type=int, help="random seed for reproducability", default=5)
     parser.add_argument('-name', '--run_name', type=str, help='Path to the configuration file',default="a_simple_run")
     parser.add_argument('-dir', '--run_dir', type=str, help='Path to the run directory',default=None)
@@ -136,6 +139,27 @@ def set_random_seed(random_seed=5):
 
 def main(args):  
     print("\nhello!!!! and happy sunshine\n")
+    # ---------------- CUDA auto-detect / CPU fallback (NEW) ----------------
+    # Several downstream calls used to hardcode "cuda"/use_cuda=True regardless
+    # of --run_reasoner_models_on_cpu, which crashed with
+    # "AssertionError: Torch not compiled with CUDA enabled" on any machine
+    # without a CUDA-enabled torch build. RUN_DEVICE/RUN_USE_CUDA below are
+    # resolved once and reused everywhere a device was previously hardcoded.
+    cuda_available = torch.cuda.is_available()
+    if args.run_reasoner_models_on_cpu or not cuda_available:
+        if not cuda_available and not args.run_reasoner_models_on_cpu:
+            print("!! CUDA not available (torch.cuda.is_available()==False) — falling back to CPU. !!")
+            print("   If you have an NVIDIA GPU and expected CUDA to work, your torch install is "
+                  "likely the CPU-only build. Fix with (adjust cu### to your CUDA version):")
+            print("     pip uninstall torch")
+            print("     pip install torch==2.3.0 --index-url https://download.pytorch.org/whl/cu118")
+        RUN_DEVICE = "cpu"
+        RUN_USE_CUDA = False
+    else:
+        RUN_DEVICE = "cuda"
+        RUN_USE_CUDA = True
+    print("[EMVR-KBC] resolved compute device: {}".format(RUN_DEVICE))
+    # -------------------------------------------------------------------------
     train_df, test_df, valid_df, id2relation_dict, id2entity_dict, all_relations, all_entities, all_relations_long_text = get_KG_data(args.dataset, verbose=True)
     entity2id_dict = _build_inverse_dict(id2entity_dict)
     relation2id_dict =  _build_inverse_dict(id2relation_dict)
@@ -149,6 +173,15 @@ def main(args):
         print("Use specific relations instead of all relations: ")
         for relation in all_relations_: print("{} ".format(relation),end="")
         print("")
+    elif args.debug_relation_limit:
+        # ---------------- debug quick-run (merged) ----------------
+        all_relations_ = all_relations[:args.debug_relation_limit]
+        print("!! debug_relation_limit={} set: running only the first {} relations !!".format(
+            args.debug_relation_limit, len(all_relations_)))
+        print("Use specific relations instead of all relations: ")
+        for relation in all_relations_: print("{} ".format(relation),end="")
+        print("")
+        # ------------------------------------------------------------
     else:
         all_relations_ = all_relations
     print("\nlearning rules for the following relations:\n",all_relations_,"\n")
@@ -199,8 +232,14 @@ def main(args):
             fname = os.path.join(subgraphs_dir, "{}_train_subgraphs.csv".format(relation_wk_idx))
             subgraphs = load_subgraphs(fname)               
             llm_inputs = convert_subgraphs_to_inputs(subgraphs)
-            save_pfx = (fname.split("/")[-1]).split("_")[0]
+            # cross-platform path parsing fix (merged): original used fname.split("/")[-1],
+            # which breaks on Windows paths; os.path.basename works on both.
+            save_pfx = os.path.splitext(os.path.basename(fname))[0].split("_")[0]
             save_dir = proposed_dir
+            if args.debug:
+                print("fname    :", fname)
+                print("save_pfx :", save_pfx)
+                print("save_dir :", save_dir)
             llm_inputs = llm_input_len_check(llm_inputs, max_char=args.llm_max_input_chars, verbose=True)
             print("[{}] removed {} / {} samples that exceed max input char count".format(time.strftime("%Y-%m-%d %H:%M"), len(subgraphs)-len(llm_inputs),len(subgraphs)),flush=True)
             proposed_rules = llm_propose_rule(llm_inputs, args.llm_name, save_dir, save_pfx, args.llm_api_key,save_pickle=False, verbose=args.verbose)
@@ -263,7 +302,8 @@ def main(args):
             else:
                 similarity_matrix = custom_similarity(embeddings, None, do_clipping=True)
             del model, tokenizer
-            torch.cuda.empty_cache()
+            if RUN_USE_CUDA:
+                torch.cuda.empty_cache()
             torch.save(similarity_matrix, semsim_fname)
             assert np.array_equal(torch.load(semsim_fname), similarity_matrix)
         n_similar_pairs = find_similar_phrases(phrases, similarity_matrix, include_self=False, verbose=False)
@@ -272,7 +312,7 @@ def main(args):
         print("[{}] do rigid reasoning without relation semantic".format(time.strftime("%Y-%m-%d %H:%M")))
         similarity_matrix = np.eye(n_relations)
     logging.info("finish computing semantic similarity matrix")
-    kge_model = get_KGE(args.dataset,use_cuda=True)
+    kge_model = get_KGE(args.dataset,use_cuda=RUN_USE_CUDA)
     train_triple = [tuple(row) for row in train_arr]
     test_triple = [tuple(row) for row in test_arr]
     valid_triple = [tuple(row) for row in valid_arr]
@@ -359,7 +399,8 @@ def main(args):
             save_nested_list(checked_rules, checked_rules_fname)
             logging.info("save learnable checked rules to disk for relation {}={}".format(relation_wk_idx, relation_text))
         print("[{}] ground {} rules for relation {}={}".format(time.strftime("%Y-%m-%d %H:%M"),len(checked_rules), relation_wk_idx, relation_text))
-    torch.cuda.empty_cache()
+    if RUN_USE_CUDA:
+        torch.cuda.empty_cache()
     del train_aligned_masks, train_chained_masks, train_ground_results, train_ground_rconds
     del test_aligned_masks, test_chained_masks, test_ground_results,test_ground_rconds
     del valid_aligned_masks, valid_chained_masks
@@ -395,15 +436,16 @@ def main(args):
                 logging.info("relation {}={}: compute trainset rule quality scores, keep triplets with at least one corresponding rule for training.".format(relation_wk_idx, relation_text))
                 train_aligned_masks, train_chained_masks, _,_ = load_grounding_results(grnd_save_prefix+"_train")
                 train_sparse = convert_arr_to_sparse_coo(train_arr, n_entities, n_relations)
-                if args.compute_rule_scoring_on_cpu:
+                if args.compute_rule_scoring_on_cpu or not RUN_USE_CUDA:
                     rule_scoring_device="cpu"
                     rule_scoring_verbose=True
                 else:
-                    rule_scoring_device="cuda"
+                    rule_scoring_device=RUN_DEVICE
                     rule_scoring_verbose=args.debug
                 trainset_triplets, trainset_scores = get_triplets_and_scores(train_sparse, train_aligned_masks, train_chained_masks, relation_wk_idx, kge_model, all_true_triple, n_entities,n_relations, kge_bsize=args.kge_bsize, cpu_num=10, device=rule_scoring_device,dataset_name=args.dataset, verbose=rule_scoring_verbose)
                 del train_aligned_masks,train_chained_masks, train_sparse
-                torch.cuda.empty_cache()
+                if RUN_USE_CUDA:
+                    torch.cuda.empty_cache()
                 if trainset_triplets is None:
                     print("no logic rules for relation={} to train on".format(relation))
                     relation_wo_learnable_logic.append(relation)
@@ -412,15 +454,16 @@ def main(args):
                     logging.info("relation {}={}: compute validset rule quality scores, keep triplets with at least one corresponding rule, keep triplets that are not included in trainset".format(relation_wk_idx, relation_text))
                     valid_aligned_masks, valid_chained_masks, _,_ = load_grounding_results(grnd_save_prefix+"_valid")
                     valid_sparse = convert_arr_to_sparse_coo(train_valid_arr, n_entities, n_relations)
-                    if args.compute_rule_scoring_on_cpu:
+                    if args.compute_rule_scoring_on_cpu or not RUN_USE_CUDA:
                         rule_scoring_device="cpu"
                         rule_scoring_verbose=True
                     else:
-                        rule_scoring_device="cuda"
+                        rule_scoring_device=RUN_DEVICE
                         rule_scoring_verbose=args.debug
                     validset_triplets, validset_scores = get_triplets_and_scores(valid_sparse, valid_aligned_masks, valid_chained_masks, relation_wk_idx, kge_model, all_true_triple, n_entities,n_relations, kge_bsize=args.kge_bsize, cpu_num=10, device=rule_scoring_device,dataset_name=args.dataset,verbose=rule_scoring_verbose)
                     del valid_sparse, valid_aligned_masks, valid_chained_masks
-                    torch.cuda.empty_cache()
+                    if RUN_USE_CUDA:
+                        torch.cuda.empty_cache()
                     valid_only_ids = get_unique_eval_query_ids(trainset_triplets, validset_triplets)
                     if len(valid_only_ids) == 0:
                         print("no logic rules for relation={} valid, skip modelling".format(relation))
@@ -429,15 +472,9 @@ def main(args):
                     else:
                         validset_triplets=[validset_triplets[idx] for idx in valid_only_ids]
                         validset_scores = validset_scores[torch.tensor(valid_only_ids, dtype=torch.long)]
-                        if args.run_reasoner_models_on_cpu:
-                            validset_scores = validset_scores.to("cpu")
-                        else:
-                            validset_scores = validset_scores.to("cuda")
-                        
-                        if args.run_reasoner_models_on_cpu:
-                            trainset_scores = trainset_scores.to("cpu")
-                        else:
-                            trainset_scores = trainset_scores.to("cuda")
+                        validset_scores = validset_scores.to(RUN_DEVICE if not args.run_reasoner_models_on_cpu else "cpu")
+
+                        trainset_scores = trainset_scores.to(RUN_DEVICE if not args.run_reasoner_models_on_cpu else "cpu")
                         logging.info("relation {}={}: saving rule quality scores for train/valid to disk".format(relation_wk_idx, relation_text))
                         torch.save(trainset_scores, train_scores_fname)
                         torch.save(validset_scores, valid_scores_fname)
@@ -459,7 +496,7 @@ def main(args):
                         model = ReasonerModelPlus(n_rules) 
                     else:
                         model = ReasonerModel(n_rules) 
-                    if not args.run_reasoner_models_on_cpu:
+                    if not args.run_reasoner_models_on_cpu and RUN_USE_CUDA:
                         model.to("cuda")
 
                     # ---------------- EMVR-KBC: warm-start init (NEW) ----------------
@@ -526,13 +563,13 @@ def main(args):
                         print("[{}] relation=({}){} did not appeared in test set".format(time.strftime("%Y-%m-%d %H:%M"), relation_wk_idx, relation))
                         continue
                     if args.use_reasoner_plus:
-                        eval_preds = test_loop_plus(eval_quries, learned_weights, learned_alpha, n_rules, n_entities, n_relations, all_true_triple, eval_cmasks, kge_model, args.kge_bsize, cpu_num=10, dataset_name=args.dataset,device="cuda")
+                        eval_preds = test_loop_plus(eval_quries, learned_weights, learned_alpha, n_rules, n_entities, n_relations, all_true_triple, eval_cmasks, kge_model, args.kge_bsize, cpu_num=10, dataset_name=args.dataset,device=RUN_DEVICE)
                     else:
-                        eval_preds = test_loop(eval_quries, learned_weights, n_rules, n_entities, n_relations, all_true_triple, eval_cmasks, kge_model, args.kge_bsize, cpu_num=10, dataset_name=args.dataset, device="cuda")
+                        eval_preds = test_loop(eval_quries, learned_weights, n_rules, n_entities, n_relations, all_true_triple, eval_cmasks, kge_model, args.kge_bsize, cpu_num=10, dataset_name=args.dataset, device=RUN_DEVICE)
                     logging.info("finish making test set predictions for relation {}={}".format(relation_wk_idx, relation_text))
                     argsort = torch.argsort(eval_preds, dim=1, descending=True) 
                     answers = argsort[:, 0]
-                    ranks = (argsort == torch.Tensor(eval_labels).unsqueeze(1).to("cuda")).nonzero(as_tuple=False)[:, 1] 
+                    ranks = (argsort == torch.Tensor(eval_labels).unsqueeze(1).to(RUN_DEVICE)).nonzero(as_tuple=False)[:, 1] 
                     ranks = ranks + 1 
                     torch.save(eval_preds, test_save_prefix+"_predicts.pt")
                     torch.save(eval_quries, test_save_prefix+"_queries.pt")
@@ -554,7 +591,7 @@ def main(args):
                 relation_notin_test_set.append(relation)
                 continue
             eval_triple = [tuple(row) for row in eval_quries]
-            eval_metrics, _, _, eval_preds, answers = kge_model.test_step(kge_model, eval_triple, all_true_triple,n_entities,n_relations,cpu_num=10,test_batch_size=args.kge_bsize, use_cuda=True,tail_only=True)
+            eval_metrics, _, _, eval_preds, answers = kge_model.test_step(kge_model, eval_triple, all_true_triple,n_entities,n_relations,cpu_num=10,test_batch_size=args.kge_bsize, use_cuda=RUN_USE_CUDA,tail_only=True)
             argsort = torch.argsort(eval_preds, dim=1, descending=True)
             ranks = (argsort == torch.from_numpy(eval_quries)[:, 2].unsqueeze(1).to(argsort.device)).nonzero(as_tuple=False)[:, 1] + 1
             logging.info("finish making test set predictions for relation {}={}".format(relation_wk_idx, relation_text))

@@ -7,6 +7,8 @@ from openai import OpenAI
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 from groq import Groq
+import time
+from google.api_core.exceptions import ResourceExhausted
 
 LLAMA_SOURCE="groq"
 
@@ -137,16 +139,37 @@ def gemini15_proposing_rules(llm_inputs, model, verbose=True):
     proposed_rules = []
     completion_results = []
     counter, count_interval = 0, 100
-    for llm_input in llm_inputs:
+    # for llm_input in llm_inputs:
+    for llm_input in llm_inputs[:1]:
         if verbose and counter % count_interval == 0:
             print("\t {} / {} Done: {}".format(counter, len(llm_inputs), time.strftime("%Y-%m-%d %H:%M")))
-        response = model.generate_content(llm_input,
-                                          safety_settings={
-                                              HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-                                              HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-                                              HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-                                              HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-                                              })
+        # response = model.generate_content(llm_input,
+        #                                   safety_settings={
+        #                                       HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+        #                                       HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+        #                                       HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+        #                                       HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+        #                                       })
+
+        while True:
+            try:
+                response = model.generate_content(llm_input,
+                                                safety_settings={
+                                                    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+                                                    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+                                                    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+                                                    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+                                                })
+
+                # Small delay between successful requests
+                time.sleep(30)
+                break
+            except ResourceExhausted as e:
+                print("\n========================================")
+                print("Gemini rate limit reached.")
+                print("Waiting 60 seconds before retrying...")
+                print("========================================\n")
+                time.sleep(60)
         try:
             proposed_rule = response.text
             proposed_rules.append(proposed_rule)
@@ -213,9 +236,9 @@ def llm_propose_rule(llm_inputs, model_name, save_dir, save_pfx, api_key,save_pi
         if verbose: print("batch API call completed. ")
     elif model_name in ["Gemini15", "gemini15"]:
         gemini_set_api(api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash-002')
-        proposed_rules, chat_results = gemini15_proposing_rules(llm_inputs, model, verbose=verbose)
-        if verbose: print("batch API call completed. ")
+        model = genai.GenerativeModel("gemini-3.5-flash")
+        proposed_rules, chat_results = gemini15_proposing_rules(llm_inputs,model, verbose=verbose)
+        if verbose:print("batch API call completed.")
     elif model_name in ["llama3", "llama"]:
         client = llama3_set_api(api_key)
         proposed_rules, chat_results = llama3_proposing_rules(llm_inputs, client, verbose=verbose)
@@ -231,6 +254,9 @@ def llm_propose_rule(llm_inputs, model_name, save_dir, save_pfx, api_key,save_pi
         with open(pickle_fname, 'wb') as handle:
             pickle.dump(proposed_rules, handle, protocol=pickle.HIGHEST_PROTOCOL)
         if verbose: print("proposed rules pickled into {}".format(pickle_fname))
+    print("save_dir :", save_dir)
+    print("save_pfx :", save_pfx)
+    print("rawrules :", os.path.join(save_dir, "{}_proposed.csv".format(save_pfx)))
     rawrules_fname = os.path.join(save_dir, "{}_proposed.csv".format(save_pfx))
     proposed_df = pd.DataFrame(proposed_rules)
     proposed_df.to_csv(rawrules_fname)

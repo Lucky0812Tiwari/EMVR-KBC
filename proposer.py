@@ -140,7 +140,7 @@ def gemini15_proposing_rules(llm_inputs, model, verbose=True):
     completion_results = []
     counter, count_interval = 0, 100
     # for llm_input in llm_inputs:
-    for llm_input in llm_inputs[:1]:
+    for llm_input in llm_inputs:
         if verbose and counter % count_interval == 0:
             print("\t {} / {} Done: {}".format(counter, len(llm_inputs), time.strftime("%Y-%m-%d %H:%M")))
         # response = model.generate_content(llm_input,
@@ -261,4 +261,3 @@ def llm_propose_rule(llm_inputs, model_name, save_dir, save_pfx, api_key,save_pi
     proposed_df = pd.DataFrame(proposed_rules)
     proposed_df.to_csv(rawrules_fname)
     return proposed_rules
-

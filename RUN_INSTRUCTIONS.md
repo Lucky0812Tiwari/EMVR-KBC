@@ -154,6 +154,42 @@ WN18RR. If `sentence-transformers`/`faiss-cpu` aren't installed or the file
 is missing, EMVR-KBC prints a warning and falls back to internal-only
 evidence automatically — it won't crash the run.
 
+## 10. Quick smoke-testing with `--debug_relation_limit`
+
+If you just want to confirm the pipeline runs end-to-end (e.g. before
+committing to a full multi-relation run on your RTX 2050), add:
+```bash
+  --debug_relation_limit 3
+```
+to any of the three stage commands. This restricts the run to the first 3
+relations in the dataset's relation list, independent of `--debug` (which
+still uses its own fixed relation subset `[1,2,4,8,16]` for a different kind
+of debug run). Both flags default to off, so normal full-dataset runs are
+unaffected unless you explicitly pass one.
+
+## 11. "Torch not compiled with CUDA enabled"
+
+`lesr.py` now auto-detects `torch.cuda.is_available()` at the top of `main()`
+and falls back to CPU everywhere (KGE loading, rule scoring, reasoner
+training/inference) instead of crashing — you'll see a line like:
+```
+!! CUDA not available (torch.cuda.is_available()==False) — falling back to CPU. !!
+[EMVR-KBC] resolved compute device: cpu
+```
+The run will complete, just slower.
+
+**But if you have an RTX 2050 and expected the GPU to be used**, this
+message means your installed `torch` is the CPU-only build — very common on
+Windows if you just ran `pip install torch==2.3.0` without a CUDA index URL.
+Fix it properly (recommended, since you *do* have a usable GPU):
+```bash
+pip uninstall torch
+pip install torch==2.3.0 --index-url https://download.pytorch.org/whl/cu118
+```
+(use `cu121` instead of `cu118` if your NVIDIA driver supports CUDA 12.1+ —
+check with `nvidia-smi`, top-right corner shows "CUDA Version: X.Y"). Then
+re-run; you should see `resolved compute device: cuda` instead.
+
 ## Troubleshooting
 
 - **`ModuleNotFoundError: No module named 'evidence'`** — make sure
